@@ -28,6 +28,7 @@
 #include <fluent-bit/flb_kafka.h>
 #include <fluent-bit/flb_aws_credentials.h>
 #include <fluent-bit/aws/flb_aws_msk_iam.h>
+#include <fluent-bit/tls/flb_tls.h>
 
 #include <fluent-bit/flb_signv4.h>
 #include <rdkafka.h>
@@ -162,11 +163,66 @@ static char *extract_region(const char *arn)
     return out;
 }
 
+/*
+ * The credential provider chain reaches AWS endpoints over HTTPS — in
+ * particular the STS AssumeRoleWithWebIdentity call that EKS IRSA depends
+ * on. Passing a NULL TLS context silently disables that sub-provider and
+ * the chain falls back to less specific credential sources, so every
+ * provider gets a dedicated TLS instance verifying against the system trust
+ * store (TLS instances cannot be shared between providers, see
+ * flb_aws_credentials.h). Destroy the provider before its TLS instance.
+ */
+static struct flb_aws_provider *msk_iam_provider_create(struct flb_aws_msk_iam *config,
+                                                        struct flb_tls **out_tls)
+{
+    struct flb_aws_provider *provider;
+    struct flb_tls *tls;
+
+    tls = flb_tls_create(FLB_TLS_CLIENT_MODE, FLB_TRUE, FLB_FALSE,
+                         NULL, NULL, NULL, NULL, NULL, NULL);
+    if (!tls) {
+        flb_error("[aws_msk_iam] failed to create TLS context for credentials provider");
+        return NULL;
+    }
+
+    provider = flb_standard_chain_provider_create(config->flb_config, tls,
+                                                  config->region, NULL, NULL,
+                                                  flb_aws_client_generator(),
+                                                  NULL);
+    if (!provider) {
+        flb_tls_destroy(tls);
+        return NULL;
+    }
+
+    /*
+     * The token-refresh callback may run on librdkafka's background thread
+     * (rd_kafka_sasl_background_callbacks_enable), outside the Fluent Bit
+     * event loop — force blocking (sync) network I/O so the credential
+     * fetch doesn't try to yield to a coroutine that doesn't exist there.
+     */
+    provider->provider_vtable->sync(provider);
+
+    *out_tls = tls;
+    return provider;
+}
+
+static void msk_iam_provider_destroy(struct flb_aws_provider *provider,
+                                     struct flb_tls *tls)
+{
+    if (provider) {
+        flb_aws_provider_destroy(provider);
+    }
+    if (tls) {
+        flb_tls_destroy(tls);
+    }
+}
+
 /* Stateless payload generator - creates AWS provider on demand */
 static flb_sds_t build_msk_iam_payload(struct flb_aws_msk_iam *config,
                                        const char *host)
 {
     struct flb_aws_provider *temp_provider = NULL;
+    struct flb_tls *temp_provider_tls = NULL;
     struct flb_aws_credentials *creds = NULL;
     flb_sds_t payload = NULL;
     int encode_result;
@@ -218,10 +274,7 @@ static flb_sds_t build_msk_iam_payload(struct flb_aws_msk_iam *config,
              host, config->region);
 
     /* Create AWS provider on-demand */
-    temp_provider = flb_standard_chain_provider_create(config->flb_config, NULL,
-                                                      config->region, NULL, NULL,
-                                                      flb_aws_client_generator(),
-                                                      NULL);
+    temp_provider = msk_iam_provider_create(config, &temp_provider_tls);
     if (!temp_provider) {
         flb_error("[aws_msk_iam] build_msk_iam_payload: failed to create AWS credentials provider");
         return NULL;
@@ -229,7 +282,7 @@ static flb_sds_t build_msk_iam_payload(struct flb_aws_msk_iam *config,
 
     if (temp_provider->provider_vtable->init(temp_provider) != 0) {
         flb_error("[aws_msk_iam] build_msk_iam_payload: failed to initialize AWS credentials provider");
-        flb_aws_provider_destroy(temp_provider);
+        msk_iam_provider_destroy(temp_provider, temp_provider_tls);
         return NULL;
     }
 
@@ -237,14 +290,14 @@ static flb_sds_t build_msk_iam_payload(struct flb_aws_msk_iam *config,
     creds = temp_provider->provider_vtable->get_credentials(temp_provider);
     if (!creds) {
         flb_error("[aws_msk_iam] build_msk_iam_payload: failed to get credentials");
-        flb_aws_provider_destroy(temp_provider);
+        msk_iam_provider_destroy(temp_provider, temp_provider_tls);
         return NULL;
     }
 
     if (!creds->access_key_id || !creds->secret_access_key) {
         flb_error("[aws_msk_iam] build_msk_iam_payload: incomplete credentials");
         flb_aws_credentials_destroy(creds);
-        flb_aws_provider_destroy(temp_provider);
+        msk_iam_provider_destroy(temp_provider, temp_provider_tls);
         return NULL;
     }
 
@@ -550,9 +603,7 @@ static flb_sds_t build_msk_iam_payload(struct flb_aws_msk_iam *config,
     if (creds) {
         flb_aws_credentials_destroy(creds);
     }
-    if (temp_provider) {
-        flb_aws_provider_destroy(temp_provider);
-    }
+    msk_iam_provider_destroy(temp_provider, temp_provider_tls);
 
     return payload;
 
@@ -597,9 +648,7 @@ error:
     if (creds) {
         flb_aws_credentials_destroy(creds);
     }
-    if (temp_provider) {
-        flb_aws_provider_destroy(temp_provider);
-    }
+    msk_iam_provider_destroy(temp_provider, temp_provider_tls);
 
     return NULL;
 }
@@ -623,6 +672,7 @@ static void oauthbearer_token_refresh_cb(rd_kafka_t *rk,
     struct flb_aws_credentials *creds = NULL;
     struct flb_kafka_opaque *kafka_opaque;
     struct flb_aws_provider *temp_provider = NULL;
+    struct flb_tls *temp_provider_tls = NULL;
     (void) oauthbearer_config;
 
     kafka_opaque = (struct flb_kafka_opaque *) opaque;
@@ -673,10 +723,7 @@ static void oauthbearer_token_refresh_cb(rd_kafka_t *rk,
     }
 
     /* Get credentials for principal (create temporary provider just for this) */
-    temp_provider = flb_standard_chain_provider_create(config->flb_config, NULL,
-                                                      config->region, NULL, NULL,
-                                                      flb_aws_client_generator(),
-                                                      NULL);
+    temp_provider = msk_iam_provider_create(config, &temp_provider_tls);
     if (temp_provider) {
         if (temp_provider->provider_vtable->init(temp_provider) == 0) {
             creds = temp_provider->provider_vtable->get_credentials(temp_provider);
@@ -707,9 +754,7 @@ static void oauthbearer_token_refresh_cb(rd_kafka_t *rk,
     if (creds) {
         flb_aws_credentials_destroy(creds);
     }
-    if (temp_provider) {
-        flb_aws_provider_destroy(temp_provider);
-    }
+    msk_iam_provider_destroy(temp_provider, temp_provider_tls);
 
     if (payload) {
         flb_sds_destroy(payload);
@@ -773,6 +818,17 @@ struct flb_aws_msk_iam *flb_aws_msk_iam_register_oauth_cb(struct flb_config *con
 
     /* Set the callback and opaque */
     rd_kafka_conf_set_oauthbearer_token_refresh_cb(kconf, oauthbearer_token_refresh_cb);
+
+    /*
+     * Create the dedicated SASL callback queue so the plugin can forward it
+     * to librdkafka's background thread after rd_kafka_new()
+     * (rd_kafka_sasl_background_callbacks_enable). Without this the refresh
+     * callback is only serviced from rd_kafka_poll(), which idle producers
+     * never call — the token then expires and every broker reconnect fails
+     * with "SASL authentication error: Access denied" until traffic resumes.
+     */
+    rd_kafka_conf_enable_sasl_queue(kconf, 1);
+
     flb_kafka_opaque_set(opaque, NULL, ctx);
     rd_kafka_conf_set_opaque(kconf, opaque);
 
