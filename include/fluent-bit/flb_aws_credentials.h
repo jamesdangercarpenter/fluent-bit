@@ -31,8 +31,22 @@
 /* Refresh creds if they will expire in 1 min or less */
 #define FLB_AWS_REFRESH_WINDOW         60
 
-/* 5 second timeout for credential related http requests */
+/*
+ * Default timeouts for credential related http requests. The connect
+ * timeout guards against an unreachable endpoint and stays short; the io
+ * timeout guards the response and must be patient: the EKS Pod Identity
+ * agent (and the ECS agent) may perform a synchronous upstream fetch on a
+ * cache miss, and hanging up early cancels that fetch server-side, leaving
+ * the agent's cache empty for every subsequent client. Both are
+ * overridable via the FLB_AWS_CREDENTIAL_CONNECT_TIMEOUT and
+ * FLB_AWS_CREDENTIAL_IO_TIMEOUT environment variables (seconds).
+ */
 #define FLB_AWS_CREDENTIAL_NET_TIMEOUT 5
+#define FLB_AWS_CREDENTIAL_IO_TIMEOUT  60
+
+/* Effective timeouts: environment override or the defaults above */
+int flb_aws_credential_connect_timeout();
+int flb_aws_credential_io_timeout();
 
 /*
  * A structure that wraps the sensitive data needed to sign an AWS request
