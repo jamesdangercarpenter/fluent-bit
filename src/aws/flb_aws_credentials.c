@@ -31,6 +31,38 @@
 #define FIVE_MINUTES   300
 #define TWELVE_HOURS   43200
 
+static int timeout_from_env(const char *name, int default_value)
+{
+    char *val;
+    int seconds;
+
+    val = getenv(name);
+    if (val == NULL || val[0] == '\0') {
+        return default_value;
+    }
+
+    seconds = atoi(val);
+    if (seconds <= 0) {
+        flb_warn("[aws_credentials] invalid %s value '%s'; using default %ds",
+                 name, val, default_value);
+        return default_value;
+    }
+
+    return seconds;
+}
+
+int flb_aws_credential_connect_timeout()
+{
+    return timeout_from_env("FLB_AWS_CREDENTIAL_CONNECT_TIMEOUT",
+                            FLB_AWS_CREDENTIAL_NET_TIMEOUT);
+}
+
+int flb_aws_credential_io_timeout()
+{
+    return timeout_from_env("FLB_AWS_CREDENTIAL_IO_TIMEOUT",
+                            FLB_AWS_CREDENTIAL_IO_TIMEOUT);
+}
+
 /* Credentials Environment Variables */
 #define AWS_ACCESS_KEY_ID              "AWS_ACCESS_KEY_ID"
 #define AWS_SECRET_ACCESS_KEY          "AWS_SECRET_ACCESS_KEY"

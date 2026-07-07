@@ -298,7 +298,8 @@ struct flb_aws_provider *flb_endpoint_provider_create(struct flb_config *config,
         return NULL;
     }
 
-    upstream->base.net.connect_timeout = FLB_AWS_CREDENTIAL_NET_TIMEOUT;
+    upstream->base.net.connect_timeout = flb_aws_credential_connect_timeout();
+    upstream->base.net.io_timeout = flb_aws_credential_io_timeout();
 
     implementation->client = generator->create();
     if (!implementation->client) {

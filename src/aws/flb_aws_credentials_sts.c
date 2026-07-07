@@ -358,7 +358,8 @@ struct flb_aws_provider *flb_sts_provider_create(struct flb_config *config,
         goto error;
     }
 
-    upstream->base.net.connect_timeout = FLB_AWS_CREDENTIAL_NET_TIMEOUT;
+    upstream->base.net.connect_timeout = flb_aws_credential_connect_timeout();
+    upstream->base.net.io_timeout = flb_aws_credential_io_timeout();
 
     implementation->sts_client->upstream = upstream;
     implementation->sts_client->host = implementation->endpoint;
@@ -655,7 +656,8 @@ struct flb_aws_provider *flb_eks_provider_create(struct flb_config *config,
         goto error;
     }
 
-    upstream->base.net.connect_timeout = FLB_AWS_CREDENTIAL_NET_TIMEOUT;
+    upstream->base.net.connect_timeout = flb_aws_credential_connect_timeout();
+    upstream->base.net.io_timeout = flb_aws_credential_io_timeout();
 
     implementation->sts_client->upstream = upstream;
     implementation->sts_client->host = implementation->endpoint;
