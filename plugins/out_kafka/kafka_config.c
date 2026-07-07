@@ -40,6 +40,9 @@ struct flb_out_kafka *flb_out_kafka_create(struct flb_output_instance *ins,
     struct flb_split_entry *entry;
     struct flb_out_kafka *ctx;
     rd_kafka_conf_res_t res;
+#ifdef FLB_HAVE_AWS_MSK_IAM
+    rd_kafka_error_t *error;
+#endif
 
     /* Configuration context */
     ctx = flb_calloc(1, sizeof(struct flb_out_kafka));
@@ -259,6 +262,28 @@ struct flb_out_kafka *flb_out_kafka_create(struct flb_output_instance *ins,
     }
     /* rd_kafka_new() succeeded, conf ownership transferred to rk */
     ctx->conf = NULL;
+
+#ifdef FLB_HAVE_AWS_MSK_IAM
+    if (ctx->msk_iam) {
+        /*
+         * By default librdkafka only services the OAUTHBEARER token-refresh
+         * callback from rd_kafka_poll(), which this plugin only calls while
+         * flushing records. On an idle output the token therefore expires
+         * (MSK IAM tokens live 15 minutes) and every broker reconnect fails
+         * with "SASL authentication error: Access denied" until traffic
+         * resumes. Run the refresh callback on librdkafka's background
+         * thread instead so it fires on schedule regardless of traffic.
+         */
+        error = rd_kafka_sasl_background_callbacks_enable(ctx->kafka.rk);
+        if (error) {
+            flb_plg_warn(ctx->ins,
+                         "failed to enable SASL background callbacks: %s; "
+                         "MSK IAM token refresh will only run while flushing",
+                         rd_kafka_error_string(error));
+            rd_kafka_error_destroy(error);
+        }
+    }
+#endif
 
 #ifdef FLB_HAVE_AVRO_ENCODER
     /* Config AVRO */

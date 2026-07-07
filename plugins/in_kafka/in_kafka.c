@@ -250,6 +250,9 @@ static int in_kafka_init(struct flb_input_instance *ins,
     rd_kafka_topic_partition_list_t *kafka_topics = NULL;
     rd_kafka_resp_err_t err = RD_KAFKA_RESP_ERR_NO_ERROR;
     rd_kafka_conf_res_t res;
+#ifdef FLB_HAVE_AWS_MSK_IAM
+    rd_kafka_error_t *rkerr;
+#endif
     char errstr[512];
     (void) data;
     char conf_val[16];
@@ -385,6 +388,27 @@ static int in_kafka_init(struct flb_input_instance *ins,
 
     /* Trigger initial token refresh for OAUTHBEARER */
     rd_kafka_poll(ctx->kafka.rk, 0);
+
+#ifdef FLB_HAVE_AWS_MSK_IAM
+    if (ctx->msk_iam) {
+        /*
+         * By default librdkafka only services the OAUTHBEARER token-refresh
+         * callback from the poll paths, so a paused or idle consumer lets
+         * the MSK IAM token (15-minute lifetime) expire and broker
+         * reconnects fail with "Access denied" until polling resumes. Run
+         * the refresh callback on librdkafka's background thread instead so
+         * it fires on schedule regardless of consumption.
+         */
+        rkerr = rd_kafka_sasl_background_callbacks_enable(ctx->kafka.rk);
+        if (rkerr) {
+            flb_plg_warn(ins,
+                         "failed to enable SASL background callbacks: %s; "
+                         "MSK IAM token refresh will only run while polling",
+                         rd_kafka_error_string(rkerr));
+            rd_kafka_error_destroy(rkerr);
+        }
+    }
+#endif
 
     conf = flb_input_get_property("topics", ins);
     if (!conf) {
