@@ -731,7 +731,19 @@ static void oauthbearer_token_refresh_cb(rd_kafka_t *rk,
     }
 
     now = time(NULL);
-    md_lifetime_ms = (now + 900) * 1000;
+    /*
+     * The presigned payload is cryptographically valid for 900s (see
+     * X-Amz-Expires=900 in build_msk_iam_payload) and 900s is the MSK IAM
+     * ceiling — it cannot be extended. librdkafka schedules the next refresh
+     * at 0.8x the lifetime we advertise here, so advertising the full 900s
+     * refreshes at 720s and leaves the held token only 180s of real life. MSK
+     * re-auth (connections.max.reauth.ms) landing in that tail re-presents the
+     * near-expired token and the broker rejects it "Session too short",
+     * dropping the connection. Advertise a shorter lifetime so the 0.8x
+     * refresh fires at ~432s, keeping ~468s of genuine validity in hand for
+     * any re-auth. The real signature lifetime is unchanged.
+     */
+    md_lifetime_ms = (now + 540) * 1000;
 
     err = rd_kafka_oauthbearer_set_token(rk,
                                         payload,
