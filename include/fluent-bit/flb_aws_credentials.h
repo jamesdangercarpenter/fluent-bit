@@ -55,6 +55,17 @@ struct flb_aws_credentials {
     flb_sds_t access_key_id;
     flb_sds_t secret_access_key;
     flb_sds_t session_token;
+
+    /*
+     * Absolute expiry (epoch seconds) of these credentials, or 0 when the
+     * provider cannot determine it (e.g. static env credentials that never
+     * expire). Providers that know the expiry populate it so consumers can
+     * refuse to use credentials that are already dead -- the EKS Pod Identity
+     * agent can return HTTP 200 carrying STS credentials whose Expiration is
+     * already in the past, which otherwise get signed into a token MSK
+     * rejects with "Access denied".
+     */
+    time_t expiration;
 };
 
 /* defined below but declared here for the function declarations */
