@@ -26,6 +26,8 @@
 #include <fluent-bit/flb_hash.h>
 #include <fluent-bit/flb_hmac.h>
 #include <fluent-bit/flb_kafka.h>
+#include <fluent-bit/flb_random.h>
+#include <fluent-bit/flb_time.h>
 #include <fluent-bit/flb_aws_credentials.h>
 #include <fluent-bit/aws/flb_aws_msk_iam.h>
 #include <fluent-bit/tls/flb_tls.h>
@@ -45,11 +47,52 @@
  */
 #define FLB_MSK_IAM_CRED_MARGIN 60
 
-/* Lightweight config - NO persistent AWS provider */
+/*
+ * Proactive credential refresh window (seconds before expiry). When cached
+ * credentials get inside this window we ask the provider for fresher ones
+ * BEFORE signing, instead of riding them down to the refuse-to-sign margin.
+ * Mirrors aws-msk-iam-auth's asyncCredentialUpdateEnabled prefetch: the
+ * signer should never see dying credentials while the supply is healthy.
+ * Sized to exceed the 540s advertised token lifetime so a signing normally
+ * has full-token-life credentials in hand. A failed refresh retains the
+ * previous (still valid) credentials, so this can only help.
+ */
+#define FLB_MSK_IAM_CRED_PREFETCH 600
+
+/*
+ * Bounded retry with full-jitter backoff around credential fetch / payload
+ * signing, mirroring aws-msk-iam-auth's MSKCredentialProvider defaults
+ * (3 attempts, 500ms base, capped backoff). Rides through momentary
+ * credential-endpoint hiccups inside one token refresh instead of failing
+ * it and waiting for librdkafka's ~10s retry cadence. The jitter matters
+ * fleet-wide: it de-synchronizes retries from pods that share a failing
+ * node-local credential agent.
+ */
+#define FLB_MSK_IAM_FETCH_ATTEMPTS 3
+#define FLB_MSK_IAM_RETRY_BASE_MS  500
+#define FLB_MSK_IAM_RETRY_MAX_MS   5000
+
+/*
+ * Config plus a persistent credential provider. The provider is created
+ * lazily on first use inside the token-refresh callback and reused across
+ * refreshes. Persistence is what buys us the standard chain's cache
+ * semantics: credentials are served from cache, auto-refreshed ahead of
+ * expiry, and - critically - RETAINED when a refresh attempt fails, so a
+ * transient credential-endpoint outage no longer means "no credentials at
+ * all" while the previous ones are still valid.
+ *
+ * Thread-safety: once rd_kafka_sasl_background_callbacks_enable() routes the
+ * refresh callback to librdkafka's background thread, that thread is the only
+ * user of the provider (creation included, since creation is lazy). Plugins
+ * destroy the rd_kafka handle (stopping that thread) before calling
+ * flb_aws_msk_iam_destroy(), so teardown cannot race a callback.
+ */
 struct flb_aws_msk_iam {
-    struct flb_config *flb_config;  /* For creating AWS provider on-demand */
+    struct flb_config *flb_config;  /* For creating the AWS provider */
     flb_sds_t region;
     flb_sds_t cluster_arn;
+    struct flb_aws_provider *provider;
+    struct flb_tls *provider_tls;
 };
 
 /* Utility functions - same as before */
@@ -224,13 +267,79 @@ static void msk_iam_provider_destroy(struct flb_aws_provider *provider,
     }
 }
 
-/* Stateless payload generator - creates AWS provider on demand */
+/*
+ * Return the persistent provider, creating and initializing it on first use.
+ * Only ever called from the token-refresh callback thread (see the struct
+ * comment). A failed init destroys the half-built provider so the next
+ * refresh attempt starts clean.
+ */
+static struct flb_aws_provider *msk_iam_get_provider(struct flb_aws_msk_iam *config)
+{
+    struct flb_aws_provider *provider;
+    struct flb_tls *tls = NULL;
+
+    if (config->provider) {
+        return config->provider;
+    }
+
+    provider = msk_iam_provider_create(config, &tls);
+    if (!provider) {
+        flb_error("[aws_msk_iam] failed to create AWS credentials provider");
+        return NULL;
+    }
+
+    if (provider->provider_vtable->init(provider) != 0) {
+        flb_error("[aws_msk_iam] failed to initialize AWS credentials provider");
+        msk_iam_provider_destroy(provider, tls);
+        return NULL;
+    }
+
+    config->provider = provider;
+    config->provider_tls = tls;
+    return provider;
+}
+
+/*
+ * Fetch credentials from the persistent provider, proactively refreshing
+ * when the cached ones are inside the prefetch window. The provider retains
+ * its previous credentials if the refresh fails, so the fallback re-get can
+ * only return the same-or-fresher credentials; the caller's margin check
+ * (refuse-to-sign) remains the final gate.
+ */
+static struct flb_aws_credentials *msk_iam_get_credentials(struct flb_aws_msk_iam *config)
+{
+    struct flb_aws_provider *provider;
+    struct flb_aws_credentials *creds;
+    struct flb_aws_credentials *fresh;
+
+    provider = msk_iam_get_provider(config);
+    if (!provider) {
+        return NULL;
+    }
+
+    creds = provider->provider_vtable->get_credentials(provider);
+
+    if (creds && creds->expiration != 0 &&
+        time(NULL) >= creds->expiration - FLB_MSK_IAM_CRED_PREFETCH) {
+        flb_debug("[aws_msk_iam] credentials expire at %ld (< %ds away), "
+                  "refreshing ahead of need",
+                  (long) creds->expiration, FLB_MSK_IAM_CRED_PREFETCH);
+        provider->provider_vtable->refresh(provider);
+        fresh = provider->provider_vtable->get_credentials(provider);
+        if (fresh) {
+            flb_aws_credentials_destroy(creds);
+            creds = fresh;
+        }
+    }
+
+    return creds;
+}
+
+/* Payload generator - uses the persistent provider via msk_iam_get_credentials */
 static flb_sds_t build_msk_iam_payload(struct flb_aws_msk_iam *config,
                                        const char *host,
                                        time_t *out_expiration)
 {
-    struct flb_aws_provider *temp_provider = NULL;
-    struct flb_tls *temp_provider_tls = NULL;
     struct flb_aws_credentials *creds = NULL;
     flb_sds_t payload = NULL;
     int encode_result;
@@ -285,31 +394,16 @@ static flb_sds_t build_msk_iam_payload(struct flb_aws_msk_iam *config,
     flb_info("[aws_msk_iam] build_msk_iam_payload: generating payload for host: %s, region: %s",
              host, config->region);
 
-    /* Create AWS provider on-demand */
-    temp_provider = msk_iam_provider_create(config, &temp_provider_tls);
-    if (!temp_provider) {
-        flb_error("[aws_msk_iam] build_msk_iam_payload: failed to create AWS credentials provider");
-        return NULL;
-    }
-
-    if (temp_provider->provider_vtable->init(temp_provider) != 0) {
-        flb_error("[aws_msk_iam] build_msk_iam_payload: failed to initialize AWS credentials provider");
-        msk_iam_provider_destroy(temp_provider, temp_provider_tls);
-        return NULL;
-    }
-
-    /* Get credentials */
-    creds = temp_provider->provider_vtable->get_credentials(temp_provider);
+    /* Get credentials from the persistent provider (prefetch-aware) */
+    creds = msk_iam_get_credentials(config);
     if (!creds) {
         flb_error("[aws_msk_iam] build_msk_iam_payload: failed to get credentials");
-        msk_iam_provider_destroy(temp_provider, temp_provider_tls);
         return NULL;
     }
 
     if (!creds->access_key_id || !creds->secret_access_key) {
         flb_error("[aws_msk_iam] build_msk_iam_payload: incomplete credentials");
         flb_aws_credentials_destroy(creds);
-        msk_iam_provider_destroy(temp_provider, temp_provider_tls);
         return NULL;
     }
 
@@ -638,7 +732,6 @@ static flb_sds_t build_msk_iam_payload(struct flb_aws_msk_iam *config,
     if (creds) {
         flb_aws_credentials_destroy(creds);
     }
-    msk_iam_provider_destroy(temp_provider, temp_provider_tls);
 
     return payload;
 
@@ -683,13 +776,34 @@ error:
     if (creds) {
         flb_aws_credentials_destroy(creds);
     }
-    msk_iam_provider_destroy(temp_provider, temp_provider_tls);
 
     return NULL;
 }
 
 
-/* Stateless callback - creates AWS provider on-demand for each refresh */
+/*
+ * Full-jitter backoff delay for the given (0-based) retry attempt:
+ * uniform random in [0, min(FLB_MSK_IAM_RETRY_MAX_MS, base << attempt)].
+ */
+static uint32_t msk_iam_retry_delay_ms(int attempt)
+{
+    uint32_t max_ms;
+    uint32_t r;
+
+    max_ms = (uint32_t) FLB_MSK_IAM_RETRY_BASE_MS << attempt;
+    if (max_ms > FLB_MSK_IAM_RETRY_MAX_MS) {
+        max_ms = FLB_MSK_IAM_RETRY_MAX_MS;
+    }
+
+    if (flb_random_bytes((unsigned char *) &r, sizeof(r)) != 0) {
+        /* no entropy available; fall back to half the window */
+        return max_ms / 2;
+    }
+
+    return r % (max_ms + 1);
+}
+
+/* Token refresh callback - runs on librdkafka's background thread */
 static void oauthbearer_token_refresh_cb(rd_kafka_t *rk,
                                          const char *oauthbearer_config,
                                          void *opaque)
@@ -705,11 +819,11 @@ static void oauthbearer_token_refresh_cb(rd_kafka_t *rk,
     const char *s3_suffix = "-s3";
     size_t arn_len;
     size_t suffix_len;
+    int attempt;
+    uint32_t delay_ms;
     struct flb_aws_msk_iam *config;
     struct flb_aws_credentials *creds = NULL;
     struct flb_kafka_opaque *kafka_opaque;
-    struct flb_aws_provider *temp_provider = NULL;
-    struct flb_tls *temp_provider_tls = NULL;
     (void) oauthbearer_config;
 
     kafka_opaque = (struct flb_kafka_opaque *) opaque;
@@ -751,21 +865,32 @@ static void oauthbearer_token_refresh_cb(rd_kafka_t *rk,
 
     flb_info("[aws_msk_iam] requesting MSK IAM payload for region: %s, host: %s", config->region, host);
 
-    /* Generate payload using stateless function - creates and destroys AWS provider internally */
-    payload = build_msk_iam_payload(config, host, &sign_expiration);
+    /*
+     * Generate the signed payload, retrying transient failures (credential
+     * endpoint hiccup, stale credentials awaiting a fresh fetch) with
+     * full-jitter backoff before giving the refresh up to librdkafka's much
+     * slower retry cadence. This thread exists exactly for this work, so a
+     * short bounded sleep here is fine.
+     */
+    for (attempt = 0; ; attempt++) {
+        payload = build_msk_iam_payload(config, host, &sign_expiration);
+        if (payload || attempt >= FLB_MSK_IAM_FETCH_ATTEMPTS - 1) {
+            break;
+        }
+        delay_ms = msk_iam_retry_delay_ms(attempt);
+        flb_warn("[aws_msk_iam] payload generation failed, retrying in %u ms "
+                 "(attempt %d of %d)",
+                 delay_ms, attempt + 2, FLB_MSK_IAM_FETCH_ATTEMPTS);
+        flb_time_msleep(delay_ms);
+    }
     if (!payload) {
         flb_error("[aws_msk_iam] failed to generate MSK IAM payload");
         rd_kafka_oauthbearer_set_token_failure(rk, "payload generation failed");
         return;
     }
 
-    /* Get credentials for principal (create temporary provider just for this) */
-    temp_provider = msk_iam_provider_create(config, &temp_provider_tls);
-    if (temp_provider) {
-        if (temp_provider->provider_vtable->init(temp_provider) == 0) {
-            creds = temp_provider->provider_vtable->get_credentials(temp_provider);
-        }
-    }
+    /* Credentials for the principal (served from the provider's cache) */
+    creds = msk_iam_get_credentials(config);
 
     now = time(NULL);
     /*
@@ -811,12 +936,10 @@ static void oauthbearer_token_refresh_cb(rd_kafka_t *rk,
         flb_info("[aws_msk_iam] OAuth bearer token successfully set");
     }
 
-    /* Clean up everything immediately - no memory leaks possible! */
+    /* Clean up (the persistent provider lives on in config) */
     if (creds) {
         flb_aws_credentials_destroy(creds);
     }
-    msk_iam_provider_destroy(temp_provider, temp_provider_tls);
-
     if (payload) {
         flb_sds_destroy(payload);
     }
@@ -838,14 +961,17 @@ struct flb_aws_msk_iam *flb_aws_msk_iam_register_oauth_cb(struct flb_config *con
         return NULL;
     }
 
-    /* Allocate lightweight config - NO AWS provider! */
+    /*
+     * Allocate the config. The credential provider is NOT created here — it
+     * is created lazily by the first token-refresh callback, on the librdkafka
+     * background thread that remains its only user (see struct comment).
+     */
     ctx = flb_calloc(1, sizeof(struct flb_aws_msk_iam));
     if (!ctx) {
         flb_errno();
         return NULL;
     }
 
-    /* Store the flb_config for on-demand provider creation */
     ctx->flb_config = config;
 
     ctx->cluster_arn = flb_sds_create(cluster_arn);
@@ -898,7 +1024,11 @@ struct flb_aws_msk_iam *flb_aws_msk_iam_register_oauth_cb(struct flb_config *con
     return ctx;
 }
 
-/* Simple destroy - just config cleanup, no AWS provider to leak! */
+/*
+ * Destroy config and the persistent provider. Callers destroy the rd_kafka
+ * handle first (stopping the background thread that uses the provider), so
+ * this cannot race the refresh callback.
+ */
 void flb_aws_msk_iam_destroy(struct flb_aws_msk_iam *ctx)
 {
     if (!ctx) {
@@ -907,7 +1037,7 @@ void flb_aws_msk_iam_destroy(struct flb_aws_msk_iam *ctx)
 
     flb_info("[aws_msk_iam] destroying MSK IAM config");
 
-    /* NO AWS provider to destroy! */
+    msk_iam_provider_destroy(ctx->provider, ctx->provider_tls);
     if (ctx->region) {
         flb_sds_destroy(ctx->region);
     }
