@@ -150,6 +150,8 @@ struct flb_aws_credentials *get_credentials_fn_http(struct flb_aws_provider
         creds->session_token = NULL;
     }
 
+    creds->expiration = implementation->creds->expiration;
+
     return creds;
 
 error:
@@ -504,6 +506,10 @@ static int http_credentials_request(struct flb_aws_provider_http
     implementation->creds = NULL;
 
     implementation->creds = creds;
+    /* Retain the absolute expiry on the credentials themselves, not only as
+     * next_refresh, so downstream consumers (e.g. MSK IAM token signing) can
+     * tell when the endpoint has handed back already-expired credentials. */
+    creds->expiration = expiration;
     implementation->next_refresh = expiration - FLB_AWS_REFRESH_WINDOW;
     flb_http_client_destroy(c);
 

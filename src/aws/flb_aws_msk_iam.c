@@ -38,6 +38,13 @@
 #include <string.h>
 #include <time.h>
 
+/*
+ * Seconds of headroom required before a credential's expiry. We refuse to sign
+ * with credentials inside this window, and cap the advertised token lifetime so
+ * librdkafka refreshes before the signing credentials die.
+ */
+#define FLB_MSK_IAM_CRED_MARGIN 60
+
 /* Lightweight config - NO persistent AWS provider */
 struct flb_aws_msk_iam {
     struct flb_config *flb_config;  /* For creating AWS provider on-demand */
@@ -219,7 +226,8 @@ static void msk_iam_provider_destroy(struct flb_aws_provider *provider,
 
 /* Stateless payload generator - creates AWS provider on demand */
 static flb_sds_t build_msk_iam_payload(struct flb_aws_msk_iam *config,
-                                       const char *host)
+                                       const char *host,
+                                       time_t *out_expiration)
 {
     struct flb_aws_provider *temp_provider = NULL;
     struct flb_tls *temp_provider_tls = NULL;
@@ -258,6 +266,10 @@ static flb_sds_t build_msk_iam_payload(struct flb_aws_msk_iam *config,
     time_t now;
 
     now = time(NULL);
+
+    if (out_expiration) {
+        *out_expiration = 0;
+    }
 
     /* Validate inputs */
     if (!config || !config->region || flb_sds_len(config->region) == 0) {
@@ -299,6 +311,29 @@ static flb_sds_t build_msk_iam_payload(struct flb_aws_msk_iam *config,
         flb_aws_credentials_destroy(creds);
         msk_iam_provider_destroy(temp_provider, temp_provider_tls);
         return NULL;
+    }
+
+    /*
+     * Refuse to sign with credentials that are already expired (or within the
+     * safety margin of expiring). The EKS Pod Identity agent can return HTTP
+     * 200 carrying STS credentials whose Expiration is already in the past;
+     * signing the presigned URL with them produces a token MSK rejects with
+     * "Access denied", which manifests as an all-broker auth burst until a
+     * fresh fetch succeeds. Failing here makes the refresh callback report a
+     * token failure so librdkafka retries with a fresh fetch instead of
+     * presenting a doomed token. expiration == 0 means the provider could not
+     * determine an expiry (e.g. static credentials), so we do not gate on it.
+     */
+    if (creds->expiration != 0 && now >= creds->expiration - FLB_MSK_IAM_CRED_MARGIN) {
+        flb_warn("[aws_msk_iam] refusing to sign: credentials expired at %ld "
+                 "(now %ld, margin %ds) - failing token refresh so a fresh "
+                 "fetch is attempted instead of presenting a rejected token",
+                 (long) creds->expiration, (long) now, FLB_MSK_IAM_CRED_MARGIN);
+        goto error;
+    }
+
+    if (out_expiration) {
+        *out_expiration = creds->expiration;
     }
 
     gmtime_r(&now, &gm);
@@ -665,6 +700,8 @@ static void oauthbearer_token_refresh_cb(rd_kafka_t *rk,
     char errstr[512];
     int64_t now;
     int64_t md_lifetime_ms;
+    time_t adv_expiry;
+    time_t sign_expiration = 0;
     const char *s3_suffix = "-s3";
     size_t arn_len;
     size_t suffix_len;
@@ -715,7 +752,7 @@ static void oauthbearer_token_refresh_cb(rd_kafka_t *rk,
     flb_info("[aws_msk_iam] requesting MSK IAM payload for region: %s, host: %s", config->region, host);
 
     /* Generate payload using stateless function - creates and destroys AWS provider internally */
-    payload = build_msk_iam_payload(config, host);
+    payload = build_msk_iam_payload(config, host, &sign_expiration);
     if (!payload) {
         flb_error("[aws_msk_iam] failed to generate MSK IAM payload");
         rd_kafka_oauthbearer_set_token_failure(rk, "payload generation failed");
@@ -742,8 +779,20 @@ static void oauthbearer_token_refresh_cb(rd_kafka_t *rk,
      * dropping the connection. Advertise a shorter lifetime so the 0.8x
      * refresh fires at ~432s, keeping ~468s of genuine validity in hand for
      * any re-auth. The real signature lifetime is unchanged.
+     *
+     * Additionally, never advertise a lifetime that outlives the credentials
+     * the payload was signed with: MSK validates the SigV4 against the STS
+     * credentials, so once they expire the held token is rejected even though
+     * librdkafka still considers it valid. Cap the advertised expiry to the
+     * signing credentials' remaining life (minus margin) so the 0.8x refresh
+     * fires before they die. sign_expiration == 0 means unknown -> no cap.
      */
-    md_lifetime_ms = (now + 540) * 1000;
+    adv_expiry = now + 540;
+    if (sign_expiration != 0 &&
+        sign_expiration - FLB_MSK_IAM_CRED_MARGIN < adv_expiry) {
+        adv_expiry = sign_expiration - FLB_MSK_IAM_CRED_MARGIN;
+    }
+    md_lifetime_ms = (int64_t) adv_expiry * 1000;
 
     err = rd_kafka_oauthbearer_set_token(rk,
                                         payload,
