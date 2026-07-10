@@ -38,6 +38,9 @@
 struct flb_tail_file {
     /* Inotify */
     int watch_fd;
+    int watch_missing;          /* rotated file's path vanished before a watch
+                                   could be added; do not retry (see
+                                   tail_fs_inotify.c) */
     /* file lookup info */
     int fd;
     int64_t size;

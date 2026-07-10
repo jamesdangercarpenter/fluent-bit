@@ -98,6 +98,7 @@ static int debug_event_mask(struct flb_tail_config *ctx,
 static int tail_fs_add(struct flb_tail_file *file, int check_rotated)
 {
     int flags;
+    int err;
     int watch_fd;
     char *name;
     struct flb_tail_config *ctx = file->config;
@@ -142,11 +143,32 @@ static int tail_fs_add(struct flb_tail_file *file, int check_rotated)
 
     /* Register or update the flags */
     watch_fd = inotify_add_watch(ctx->fd_notify, name, flags);
+    err = errno;
     flb_free(name);
 
     if (watch_fd == -1) {
+        /*
+         * The file's path can legitimately be gone by the time we try to
+         * watch it: rotated files are commonly renamed and then deleted (the
+         * kubelet's container log rotation), and a just-discovered file can
+         * be deleted (pod teardown) between open(2) and here — in that case
+         * flb_tail_file_name resolves via /proc to "<name> (deleted)". ENOENT
+         * is then an expected outcome, not an error: there is nothing left on
+         * disk to watch, and the open fd still drains whatever remains
+         * readable via the progress-check reconcile. Mark the file so the
+         * reconcile timer does not retry the watch every
+         * progress_check_interval for as long as the file lingers in the
+         * tracked list; once drained, reconcile removes it (st_nlink == 0).
+         */
+        if (err == ENOENT) {
+            flb_plg_debug(ctx->ins, "inode=%"PRIu64" file %s no longer "
+                          "exists, skipping inotify watch",
+                          file->inode, file->name);
+            file->watch_missing = FLB_TRUE;
+            return 0;
+        }
         flb_errno();
-        if (errno == ENOSPC) {
+        if (err == ENOSPC) {
             flb_plg_error(ctx->ins, "inotify: The user limit on the total "
                           "number of inotify watches was reached or the kernel "
                           "failed to allocate a needed resource (ENOSPC)");
@@ -154,6 +176,7 @@ static int tail_fs_add(struct flb_tail_file *file, int check_rotated)
         return -1;
     }
     file->watch_fd = watch_fd;
+    file->watch_missing = FLB_FALSE;
     flb_plg_info(ctx->ins, "inotify_fs_add(): inode=%"PRIu64" watch_fd=%i name=%s",
                  file->inode, watch_fd, file->name);
     return 0;
@@ -245,7 +268,8 @@ static int reconcile_file_state(struct flb_tail_config *ctx,
         return -1;
     }
 
-    if (file->rotated != 0 && file->watch_fd == -1) {
+    if (file->rotated != 0 && file->watch_fd == -1 &&
+        file->watch_missing == FLB_FALSE) {
         ret = flb_tail_fs_add_rotated(file);
         if (ret == -1) {
             return -1;
