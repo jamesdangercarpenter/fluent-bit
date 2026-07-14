@@ -266,6 +266,37 @@ static struct flb_aws_provider_vtable standard_chain_provider_vtable = {
     .upstream_set = upstream_set_fn_standard_chain,
 };
 
+/*
+ * Refresh only the chain's currently-selected sub-provider, for routine
+ * (proactive) refreshes where the credential source is known-good.
+ *
+ * refresh_fn_standard_chain re-walks the whole chain: every sub-provider
+ * ahead of the selected one gets a refresh attempt, which (a) logs
+ * error-level noise from providers that legitimately have nothing (the
+ * profile provider's "Shared credentials file does not exist" on every call
+ * in a container) and (b) can silently switch sub_provider — e.g. fall
+ * through to IMDS node-role credentials during a momentary EKS Pod Identity
+ * hiccup, authenticating as the wrong principal. Both are acceptable for the
+ * chain's intended use of refresh (recovering after an auth error) but wrong
+ * for a routine proactive refresh. Falls back to the full-chain walk when no
+ * sub-provider has been selected yet, or the provider is not a chain.
+ */
+int flb_standard_chain_provider_refresh_current(struct flb_aws_provider *provider)
+{
+    struct flb_aws_provider_chain *implementation;
+    struct flb_aws_provider *sub_provider;
+
+    if (provider->provider_vtable == &standard_chain_provider_vtable) {
+        implementation = provider->implementation;
+        sub_provider = implementation->sub_provider;
+        if (sub_provider) {
+            return sub_provider->provider_vtable->refresh(sub_provider);
+        }
+    }
+
+    return provider->provider_vtable->refresh(provider);
+}
+
 struct flb_aws_provider *flb_standard_chain_provider_create(struct flb_config
                                                             *config,
                                                             struct flb_tls *tls,

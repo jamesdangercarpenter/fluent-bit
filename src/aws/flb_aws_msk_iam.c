@@ -324,7 +324,14 @@ static struct flb_aws_credentials *msk_iam_get_credentials(struct flb_aws_msk_ia
         flb_debug("[aws_msk_iam] credentials expire at %ld (< %ds away), "
                   "refreshing ahead of need",
                   (long) creds->expiration, FLB_MSK_IAM_CRED_PREFETCH);
-        provider->provider_vtable->refresh(provider);
+        /*
+         * Refresh only the selected sub-provider: a full-chain refresh
+         * re-probes every provider ahead of it (error-level "Shared
+         * credentials file does not exist" from the profile provider on
+         * every prefetch) and can silently switch the chain to another
+         * credential source (e.g. IMDS node role) on a transient hiccup.
+         */
+        flb_standard_chain_provider_refresh_current(provider);
         fresh = provider->provider_vtable->get_credentials(provider);
         if (fresh) {
             flb_aws_credentials_destroy(creds);
