@@ -190,6 +190,15 @@ struct flb_aws_provider *flb_standard_chain_provider_create(struct flb_config
                                                             *generator,
                                                             char *profile);
 
+/*
+ * Refresh only the standard chain's currently-selected sub-provider. For
+ * routine proactive refreshes: avoids the full-chain re-walk, which logs
+ * error-level noise from empty providers and can silently switch the chain
+ * to a different credential source. Falls back to a full provider refresh
+ * when no sub-provider is selected yet or the provider is not a chain.
+ */
+int flb_standard_chain_provider_refresh_current(struct flb_aws_provider *provider);
+
 /* Provide base configuration options for managed chain */
 #define FLB_AWS_CREDENTIAL_BASE_CONFIG_MAP(prefix)                                    \
     {                                                                                 \
