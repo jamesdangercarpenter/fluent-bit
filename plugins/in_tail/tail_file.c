@@ -2206,6 +2206,21 @@ int flb_tail_file_is_rotated(struct flb_tail_config *ctx,
     /* Get stats from the file name */
     ret = tail_file_stat(ctx, name, &st);
     if (ret == -1) {
+        /*
+         * ENOENT is the common rotate-and-delete race (kubelet log rotation,
+         * pod teardown): the resolved path is already gone. Treat it as a
+         * rotation like the is_link branch above does — the rotated-file
+         * handling drains what the open fd can still read and reaps the file
+         * once consumed. Anything else is a real error. Without this, the 2s
+         * reconcile timer re-stats the dead path forever, logging
+         * "errno=2 No such file or directory" at error level each pass.
+         */
+        if (errno == ENOENT) {
+            flb_plg_debug(ctx->ins, "inode=%"PRIu64" rotated (path gone): %s",
+                          file->inode, name);
+            flb_free(name);
+            return FLB_TRUE;
+        }
         flb_errno();
         flb_free(name);
         return -1;
