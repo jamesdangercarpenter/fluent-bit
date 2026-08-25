@@ -136,7 +136,21 @@ static void flb_http_server_connection_drop(struct flb_connection *connection)
     connection->drop_notification_callback = NULL;
 }
 
-static void flb_http_server_reap_stale_sessions(struct flb_http_server *server)
+/*
+ * Destroy sessions whose connection is gone.
+ *
+ * Sessions flagged drop_pending had their connection dropped by the
+ * downstream layer (idle timeout); the drop handler defers destruction
+ * because an event referencing the session may still be queued in the
+ * event batch being processed. Once the batch is fully processed no such
+ * reference can remain (the drop already removed the event from the
+ * loop), so callers running between batches pass include_dropped=TRUE to
+ * collect them; without that they are never destroyed and every
+ * server-side idle close leaks the whole session (~tens of KB: request
+ * and response buffers included).
+ */
+static void flb_http_server_reap_stale_sessions(struct flb_http_server *server,
+                                                int include_dropped)
 {
     struct cfl_list                *iterator_backup;
     struct cfl_list                *iterator;
@@ -149,7 +163,7 @@ static void flb_http_server_reap_stale_sessions(struct flb_http_server *server)
                                  struct flb_http_server_session,
                                  _head);
 
-        if (session->drop_pending == FLB_FALSE &&
+        if ((include_dropped || session->drop_pending == FLB_FALSE) &&
             (session->connection == NULL ||
              session->connection->fd == FLB_INVALID_SOCKET)) {
             flb_http_server_session_destroy(session);
@@ -480,7 +494,7 @@ static int flb_http_server_client_connection_event_handler(void *data)
     }
 
     if (server->max_connections > 0) {
-        flb_http_server_reap_stale_sessions(server);
+        flb_http_server_reap_stale_sessions(server, FLB_FALSE);
 
         if (flb_http_server_client_count(server) >= server->max_connections) {
             flb_downstream_conn_release(connection);
@@ -550,7 +564,7 @@ static void flb_http_server_worker_maintenance(struct flb_config *config,
         flb_downstream_conn_timeouts_stream(worker->server.downstream);
     }
 
-    flb_http_server_reap_stale_sessions(&worker->server);
+    flb_http_server_reap_stale_sessions(&worker->server, FLB_TRUE);
 }
 
 static int flb_http_server_worker_initialize(
