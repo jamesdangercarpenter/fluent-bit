@@ -1032,6 +1032,61 @@ struct flb_aws_msk_iam *flb_aws_msk_iam_register_oauth_cb(struct flb_config *con
 }
 
 /*
+ * Route the token-refresh callback to librdkafka's background thread.
+ *
+ * flb_aws_msk_iam_register_oauth_cb() enables the dedicated SASL queue, which
+ * is a prerequisite for forwarding it to the background thread but also takes
+ * the callback off the main queue: rd_kafka_poll() no longer serves it. So if
+ * the forward fails and we leave the SASL queue unattended, the callback never
+ * runs at all - not even once for the initial token - and every broker
+ * connection fails authentication forever. Fall back to the main queue in that
+ * case, which restores exactly the poll-driven behaviour of an unpatched
+ * build.
+ *
+ * Returns FLB_MSK_IAM_REFRESH_BACKGROUND when the refresh runs on the
+ * background thread, FLB_MSK_IAM_REFRESH_POLL when it fell back to the
+ * poll path, or -1 when neither queue is available.
+ */
+int flb_aws_msk_iam_enable_background_refresh(rd_kafka_t *rk)
+{
+    rd_kafka_error_t *error;
+    rd_kafka_queue_t *sasl_queue;
+    rd_kafka_queue_t *main_queue;
+
+    error = rd_kafka_sasl_background_callbacks_enable(rk);
+    if (!error) {
+        return FLB_MSK_IAM_REFRESH_BACKGROUND;
+    }
+
+    flb_warn("[aws_msk_iam] cannot serve the token refresh on librdkafka's "
+             "background thread: %s", rd_kafka_error_string(error));
+    rd_kafka_error_destroy(error);
+
+    sasl_queue = rd_kafka_queue_get_sasl(rk);
+    if (!sasl_queue) {
+        flb_error("[aws_msk_iam] no SASL queue to fall back on: the token "
+                  "refresh callback will never run and MSK IAM "
+                  "authentication cannot succeed");
+        return -1;
+    }
+
+    main_queue = rd_kafka_queue_get_main(rk);
+    if (!main_queue) {
+        rd_kafka_queue_destroy(sasl_queue);
+        flb_error("[aws_msk_iam] no main queue to fall back on: the token "
+                  "refresh callback will never run and MSK IAM "
+                  "authentication cannot succeed");
+        return -1;
+    }
+
+    rd_kafka_queue_forward(sasl_queue, main_queue);
+    rd_kafka_queue_destroy(sasl_queue);
+    rd_kafka_queue_destroy(main_queue);
+
+    return FLB_MSK_IAM_REFRESH_POLL;
+}
+
+/*
  * Destroy config and the persistent provider. Callers destroy the rd_kafka
  * handle first (stopping the background thread that uses the provider), so
  * this cannot race the refresh callback.

@@ -34,6 +34,10 @@ struct flb_msk_iam_cb {
     char *broker_host;  /* Store the actual broker hostname */
 };
 
+/* Where the OAUTHBEARER token-refresh callback is serviced from */
+#define FLB_MSK_IAM_REFRESH_BACKGROUND 0  /* librdkafka's background thread */
+#define FLB_MSK_IAM_REFRESH_POLL       1  /* the plugin's poll path */
+
 /*
  * Register the oauthbearer refresh callback for MSK IAM authentication.
  * Returns context pointer on success or NULL on failure.
@@ -42,6 +46,15 @@ struct flb_aws_msk_iam *flb_aws_msk_iam_register_oauth_cb(struct flb_config *con
                                                           rd_kafka_conf_t *kconf,
                                                           const char *cluster_arn,
                                                           struct flb_kafka_opaque *opaque);
+
+/*
+ * Route the token-refresh callback to librdkafka's background thread so it
+ * fires on schedule regardless of traffic. Call once after rd_kafka_new().
+ * Returns FLB_MSK_IAM_REFRESH_BACKGROUND, FLB_MSK_IAM_REFRESH_POLL when it
+ * had to fall back to the poll path, or -1 when the refresh cannot be
+ * serviced at all.
+ */
+int flb_aws_msk_iam_enable_background_refresh(rd_kafka_t *rk);
 void flb_aws_msk_iam_destroy(struct flb_aws_msk_iam *ctx);
 
 #endif
