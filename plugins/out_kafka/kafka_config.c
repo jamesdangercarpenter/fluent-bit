@@ -40,9 +40,6 @@ struct flb_out_kafka *flb_out_kafka_create(struct flb_output_instance *ins,
     struct flb_split_entry *entry;
     struct flb_out_kafka *ctx;
     rd_kafka_conf_res_t res;
-#ifdef FLB_HAVE_AWS_MSK_IAM
-    rd_kafka_error_t *error;
-#endif
 
     /* Configuration context */
     ctx = flb_calloc(1, sizeof(struct flb_out_kafka));
@@ -277,13 +274,16 @@ struct flb_out_kafka *flb_out_kafka_create(struct flb_output_instance *ins,
          * resumes. Run the refresh callback on librdkafka's background
          * thread instead so it fires on schedule regardless of traffic.
          */
-        error = rd_kafka_sasl_background_callbacks_enable(ctx->kafka.rk);
-        if (error) {
-            flb_plg_warn(ctx->ins,
-                         "failed to enable SASL background callbacks: %s; "
-                         "MSK IAM token refresh will only run while flushing",
-                         rd_kafka_error_string(error));
-            rd_kafka_error_destroy(error);
+        ret = flb_aws_msk_iam_enable_background_refresh(ctx->kafka.rk);
+        if (ret == FLB_MSK_IAM_REFRESH_POLL) {
+            flb_plg_warn(ctx->ins, "MSK IAM token refresh fell back to the "
+                                   "poll path; an idle output may let the "
+                                   "token expire");
+        }
+        else if (ret == -1) {
+            flb_plg_error(ctx->ins, "MSK IAM token refresh cannot be serviced");
+            flb_out_kafka_destroy(ctx);
+            return NULL;
         }
     }
 #endif
