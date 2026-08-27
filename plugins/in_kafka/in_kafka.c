@@ -250,9 +250,6 @@ static int in_kafka_init(struct flb_input_instance *ins,
     rd_kafka_topic_partition_list_t *kafka_topics = NULL;
     rd_kafka_resp_err_t err = RD_KAFKA_RESP_ERR_NO_ERROR;
     rd_kafka_conf_res_t res;
-#ifdef FLB_HAVE_AWS_MSK_IAM
-    rd_kafka_error_t *rkerr;
-#endif
     char errstr[512];
     (void) data;
     char conf_val[16];
@@ -399,13 +396,14 @@ static int in_kafka_init(struct flb_input_instance *ins,
          * the refresh callback on librdkafka's background thread instead so
          * it fires on schedule regardless of consumption.
          */
-        rkerr = rd_kafka_sasl_background_callbacks_enable(ctx->kafka.rk);
-        if (rkerr) {
-            flb_plg_warn(ins,
-                         "failed to enable SASL background callbacks: %s; "
-                         "MSK IAM token refresh will only run while polling",
-                         rd_kafka_error_string(rkerr));
-            rd_kafka_error_destroy(rkerr);
+        ret = flb_aws_msk_iam_enable_background_refresh(ctx->kafka.rk);
+        if (ret == FLB_MSK_IAM_REFRESH_POLL) {
+            flb_plg_warn(ins, "MSK IAM token refresh fell back to the poll "
+                              "path; an idle consumer may let the token expire");
+        }
+        else if (ret == -1) {
+            flb_plg_error(ins, "MSK IAM token refresh cannot be serviced");
+            goto init_error;
         }
     }
 #endif
@@ -475,6 +473,12 @@ init_error:
         rd_kafka_consumer_close(ctx->kafka.rk);
         rd_kafka_destroy(ctx->kafka.rk);
     }
+#ifdef FLB_HAVE_AWS_MSK_IAM
+    /* Destroyed after the rd_kafka handle, which uses its credentials */
+    if (ctx->msk_iam) {
+        flb_aws_msk_iam_destroy(ctx->msk_iam);
+    }
+#endif
     if (ctx->opaque) {
         flb_kafka_opaque_destroy(ctx->opaque);
     }
