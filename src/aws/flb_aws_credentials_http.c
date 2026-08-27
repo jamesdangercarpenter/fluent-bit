@@ -418,7 +418,12 @@ static int http_credentials_request(struct flb_aws_provider_http
 {
     char *response = NULL;
     size_t response_len;
-    time_t expiration;
+    /*
+     * 0 means "no expiry known". flb_parse_http_credentials leaves this
+     * untouched when the response carries no Expiration field at all, so it
+     * must start from a defined value rather than an indeterminate one.
+     */
+    time_t expiration = 0;
     struct flb_aws_credentials *creds = NULL;
     struct flb_aws_client *client = implementation->client;
     struct flb_http_client *c = NULL;
@@ -506,10 +511,20 @@ static int http_credentials_request(struct flb_aws_provider_http
     implementation->creds = NULL;
 
     implementation->creds = creds;
-    /* Retain the absolute expiry on the credentials themselves, not only as
+    /*
+     * Retain the absolute expiry on the credentials themselves, not only as
      * next_refresh, so downstream consumers (e.g. MSK IAM token signing) can
-     * tell when the endpoint has handed back already-expired credentials. */
-    creds->expiration = expiration;
+     * tell when the endpoint has handed back already-expired credentials.
+     *
+     * Only a parsed expiry counts: the field may be absent from the response
+     * (expiration stays 0) and flb_aws_cred_expiration() returns -1 for a
+     * value it cannot parse. Both mean "unknown", which the credentials
+     * represent as 0 -- passing either through verbatim would make every
+     * consumer read these credentials as long expired.
+     */
+    if (expiration > 0) {
+        creds->expiration = expiration;
+    }
     implementation->next_refresh = expiration - FLB_AWS_REFRESH_WINDOW;
     flb_http_client_destroy(c);
 
