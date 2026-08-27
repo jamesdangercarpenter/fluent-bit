@@ -227,6 +227,93 @@ static char *extract_region(const char *arn)
  * store (TLS instances cannot be shared between providers, see
  * flb_aws_credentials.h). Destroy the provider before its TLS instance.
  */
+/*
+ * Extract the AWS region from an MSK broker hostname, used when the cluster
+ * ARN does not carry one. The region is the label immediately before
+ * '.amazonaws.com', or before '.vpce.amazonaws.com' for a VPC endpoint:
+ *
+ *   b-1.demo.abc123.c2.kafka.us-east-2.amazonaws.com:9098   -> us-east-2
+ *   boot-abc123.c1.kafka-serverless.eu-west-1.amazonaws.com -> eu-west-1
+ *   vpce-0abc.kafka.ap-southeast-2.vpce.amazonaws.com:9098  -> ap-southeast-2
+ */
+static char *extract_region_from_broker(const char *broker)
+{
+    const char *suffix = ".amazonaws.com";
+    const char *vpce = ".vpce";
+    const char *host_end;
+    const char *start;
+    const char *end;
+    size_t len;
+    char *out;
+
+    if (!broker || *broker == '\0') {
+        return NULL;
+    }
+
+    /* Ignore anything from the port separator onwards */
+    host_end = strchr(broker, ':');
+    if (!host_end) {
+        host_end = broker + strlen(broker);
+    }
+
+    end = strstr(broker, suffix);
+    if (!end || end >= host_end) {
+        return NULL;
+    }
+
+    /* A VPC endpoint carries the region one label further left */
+    if ((size_t) (end - broker) >= strlen(vpce) &&
+        strncmp(end - strlen(vpce), vpce, strlen(vpce)) == 0) {
+        end -= strlen(vpce);
+    }
+
+    start = end;
+    while (start > broker && *(start - 1) != '.') {
+        start--;
+    }
+
+    len = end - start;
+    /* Region labels are never empty and comfortably shorter than this */
+    if (len == 0 || len > 32) {
+        return NULL;
+    }
+
+    out = flb_malloc(len + 1);
+    if (!out) {
+        flb_errno();
+        return NULL;
+    }
+    memcpy(out, start, len);
+    out[len] = '\0';
+
+    return out;
+}
+
+/*
+ * Region from the first entry of the librdkafka 'bootstrap.servers' property,
+ * which both plugins have already set on the conf by the time the callback is
+ * registered. Used only as a fallback for an ARN without a region.
+ */
+static char *extract_region_from_conf(rd_kafka_conf_t *kconf)
+{
+    char brokers[1024];
+    size_t size;
+    char *comma;
+
+    size = sizeof(brokers);
+    if (rd_kafka_conf_get(kconf, "bootstrap.servers",
+                          brokers, &size) != RD_KAFKA_CONF_OK) {
+        return NULL;
+    }
+
+    comma = strchr(brokers, ',');
+    if (comma) {
+        *comma = '\0';
+    }
+
+    return extract_region_from_broker(brokers);
+}
+
 static struct flb_aws_provider *msk_iam_provider_create(struct flb_aws_msk_iam *config,
                                                         struct flb_tls **out_tls)
 {
@@ -938,10 +1025,28 @@ struct flb_aws_msk_iam *flb_aws_msk_iam_register_oauth_cb(struct flb_config *con
     /* Extract region */
     region_str = extract_region(cluster_arn);
     if (!region_str || strlen(region_str) == 0) {
+        /*
+         * An ARN without a usable region field is not fatal on its own: the
+         * broker hostnames carry the region too, so fall back to those before
+         * giving up (MSK Serverless and VPC-endpoint names included).
+         */
+        if (region_str) {
+            flb_free(region_str);
+        }
+        region_str = extract_region_from_conf(kconf);
+        if (region_str) {
+            flb_info("[aws_msk_iam] cluster ARN carries no region, using the "
+                     "region from the broker hostnames");
+        }
+    }
+
+    if (!region_str || strlen(region_str) == 0) {
         flb_error("[aws_msk_iam] failed to extract region from cluster ARN: %s", cluster_arn);
         flb_sds_destroy(ctx->cluster_arn);
         flb_free(ctx);
-        if (region_str) flb_free(region_str);
+        if (region_str) {
+            flb_free(region_str);
+        }
         return NULL;
     }
 
