@@ -618,94 +618,42 @@ static flb_sds_t build_msk_iam_payload(struct flb_aws_msk_iam *config,
     }
     query = tmp;
 
-    /* Build the complete presigned URL */
+    /*
+     * Build the presigned URL and base64url-encode it. The User-Agent
+     * parameter is part of the signed URL, matching the Go implementation.
+     * The encoding is RawURLEncoding: '+' becomes '-', '/' becomes '_' and
+     * the '=' padding is stripped.
+     */
     presigned_url = flb_sds_create_size(16384);
     if (!presigned_url) {
         goto error;
     }
 
-    presigned_url = flb_sds_printf(&presigned_url, "https://%s/?%s", host, query);
-    if (!presigned_url) {
-        goto error;
-    }
-
-    /* Base64 URL encode the presigned URL */
-    url_len = flb_sds_len(presigned_url);
-    encoded_len = ((url_len + 2) / 3) * 4 + 1; /* Base64 encoding size + null terminator */
-
-    payload = flb_sds_create_size(encoded_len);
-    if (!payload) {
-        goto error;
-    }
-
-    encode_result = flb_base64_encode((unsigned char*) payload, encoded_len, &actual_encoded_len,
-                                     (const unsigned char*) presigned_url, url_len);
-    if (encode_result == -1) {
-        flb_error("[aws_msk_iam] build_msk_iam_payload: failed to base64 encode URL");
-        goto error;
-    }
-    flb_sds_len_set(payload, actual_encoded_len);
-
-    /* Convert to Base64 URL encoding (replace + with -, / with _, remove padding =) */
-    p = payload;
-    while (*p) {
-        if (*p == '+') {
-            *p = '-';
-        }
-        else if (*p == '/') {
-            *p = '_';
-        }
-        p++;
-    }
-
-    /* Remove padding */
-    len = flb_sds_len(payload);
-    while (len > 0 && payload[len-1] == '=') {
-        len--;
-    }
-    flb_sds_len_set(payload, len);
-    payload[len] = '\0';
-
-    /* Build the complete presigned URL */
-    flb_sds_destroy(presigned_url);
-    presigned_url = flb_sds_create_size(16384);
-    if (!presigned_url) {
-        goto error;
-    }
-
-    presigned_url = flb_sds_printf(&presigned_url, "https://%s/?%s", host, query);
-    if (!presigned_url) {
-        goto error;
-    }
-
-    /* Add User-Agent parameter to the signed URL (like Go implementation) */
-    tmp = flb_sds_printf(&presigned_url, "&User-Agent=fluent-bit-msk-iam");
+    tmp = flb_sds_printf(&presigned_url,
+                         "https://%s/?%s&User-Agent=fluent-bit-msk-iam",
+                         host, query);
     if (!tmp) {
         goto error;
     }
     presigned_url = tmp;
 
-    /* Base64 URL encode the presigned URL (RawURLEncoding - no padding like Go) */
     url_len = flb_sds_len(presigned_url);
-    encoded_len = ((url_len + 2) / 3) * 4 + 1; /* Base64 encoding size + null terminator */
+    encoded_len = ((url_len + 2) / 3) * 4 + 1; /* Base64 size + null terminator */
 
-    flb_sds_destroy(payload);
     payload = flb_sds_create_size(encoded_len);
     if (!payload) {
         goto error;
     }
 
-    encode_result = flb_base64_encode((unsigned char*) payload, encoded_len, &actual_encoded_len,
-                                     (const unsigned char *) presigned_url, url_len);
+    encode_result = flb_base64_encode((unsigned char *) payload, encoded_len,
+                                      &actual_encoded_len,
+                                      (const unsigned char *) presigned_url, url_len);
     if (encode_result == -1) {
         flb_error("[aws_msk_iam] build_msk_iam_payload: failed to base64 encode URL");
         goto error;
     }
-
-    /* Update the SDS length to match actual encoded length */
     flb_sds_len_set(payload, actual_encoded_len);
 
-    /* Convert to Base64 URL encoding AND remove padding (RawURLEncoding like Go) */
     p = payload;
     while (*p) {
         if (*p == '+') {
@@ -717,9 +665,8 @@ static flb_sds_t build_msk_iam_payload(struct flb_aws_msk_iam *config,
         p++;
     }
 
-    /* Remove ALL padding (RawURLEncoding) */
     final_len = flb_sds_len(payload);
-    while (final_len > 0 && payload[final_len-1] == '=') {
+    while (final_len > 0 && payload[final_len - 1] == '=') {
         final_len--;
     }
     flb_sds_len_set(payload, final_len);
