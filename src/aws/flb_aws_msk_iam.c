@@ -35,6 +35,7 @@
 #include <fluent-bit/flb_signv4.h>
 #include <rdkafka.h>
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -81,10 +82,13 @@
  * transient credential-endpoint outage no longer means "no credentials at
  * all" while the previous ones are still valid.
  *
- * Thread-safety: once rd_kafka_sasl_background_callbacks_enable() routes the
- * refresh callback to librdkafka's background thread, that thread is the only
- * user of the provider (creation included, since creation is lazy). Plugins
- * destroy the rd_kafka handle (stopping that thread) before calling
+ * Thread-safety: the refresh callback normally runs on librdkafka's background
+ * thread, but it is not guaranteed to be the only caller - the initial token
+ * for a consumer is fetched from a poll before the background queue is in
+ * place, and an output configured with several workers polls from each of
+ * them if the background queue could not be enabled. provider_lock therefore
+ * guards both the lazy creation and every use of the provider. Plugins
+ * destroy the rd_kafka handle (stopping the callbacks) before calling
  * flb_aws_msk_iam_destroy(), so teardown cannot race a callback.
  */
 struct flb_aws_msk_iam {
@@ -93,6 +97,7 @@ struct flb_aws_msk_iam {
     flb_sds_t cluster_arn;
     struct flb_aws_provider *provider;
     struct flb_tls *provider_tls;
+    pthread_mutex_t provider_lock;
 };
 
 /* Utility functions - same as before */
@@ -269,9 +274,8 @@ static void msk_iam_provider_destroy(struct flb_aws_provider *provider,
 
 /*
  * Return the persistent provider, creating and initializing it on first use.
- * Only ever called from the token-refresh callback thread (see the struct
- * comment). A failed init destroys the half-built provider so the next
- * refresh attempt starts clean.
+ * The caller must hold provider_lock. A failed init destroys the half-built
+ * provider so the next refresh attempt starts clean.
  */
 static struct flb_aws_provider *msk_iam_get_provider(struct flb_aws_msk_iam *config)
 {
@@ -305,6 +309,10 @@ static struct flb_aws_provider *msk_iam_get_provider(struct flb_aws_msk_iam *con
  * its previous credentials if the refresh fails, so the fallback re-get can
  * only return the same-or-fresher credentials; the caller's margin check
  * (refuse-to-sign) remains the final gate.
+ *
+ * Holds provider_lock across the whole operation, so concurrent callers
+ * serialize on one fetch instead of racing the lazy provider creation. The
+ * returned credentials are a private copy owned by the caller.
  */
 static struct flb_aws_credentials *msk_iam_get_credentials(struct flb_aws_msk_iam *config)
 {
@@ -312,8 +320,11 @@ static struct flb_aws_credentials *msk_iam_get_credentials(struct flb_aws_msk_ia
     struct flb_aws_credentials *creds;
     struct flb_aws_credentials *fresh;
 
+    pthread_mutex_lock(&config->provider_lock);
+
     provider = msk_iam_get_provider(config);
     if (!provider) {
+        pthread_mutex_unlock(&config->provider_lock);
         return NULL;
     }
 
@@ -339,15 +350,21 @@ static struct flb_aws_credentials *msk_iam_get_credentials(struct flb_aws_msk_ia
         }
     }
 
+    pthread_mutex_unlock(&config->provider_lock);
+
     return creds;
 }
 
-/* Payload generator - uses the persistent provider via msk_iam_get_credentials */
+/*
+ * Payload generator. The caller owns 'creds' and keeps them alive for the
+ * duration of the call: signing and the token metadata (principal name,
+ * advertised lifetime) must all derive from the same credentials, so the
+ * fetch deliberately lives in the caller rather than here.
+ */
 static flb_sds_t build_msk_iam_payload(struct flb_aws_msk_iam *config,
                                        const char *host,
-                                       time_t *out_expiration)
+                                       struct flb_aws_credentials *creds)
 {
-    struct flb_aws_credentials *creds = NULL;
     flb_sds_t payload = NULL;
     int encode_result;
     char *p;
@@ -383,10 +400,6 @@ static flb_sds_t build_msk_iam_payload(struct flb_aws_msk_iam *config,
 
     now = time(NULL);
 
-    if (out_expiration) {
-        *out_expiration = 0;
-    }
-
     /* Validate inputs */
     if (!config || !config->region || flb_sds_len(config->region) == 0) {
         flb_error("[aws_msk_iam] build_msk_iam_payload: region is not set or invalid");
@@ -401,16 +414,9 @@ static flb_sds_t build_msk_iam_payload(struct flb_aws_msk_iam *config,
     flb_info("[aws_msk_iam] build_msk_iam_payload: generating payload for host: %s, region: %s",
              host, config->region);
 
-    /* Get credentials from the persistent provider (prefetch-aware) */
-    creds = msk_iam_get_credentials(config);
-    if (!creds) {
-        flb_error("[aws_msk_iam] build_msk_iam_payload: failed to get credentials");
-        return NULL;
-    }
-
-    if (!creds->access_key_id || !creds->secret_access_key) {
-        flb_error("[aws_msk_iam] build_msk_iam_payload: incomplete credentials");
-        flb_aws_credentials_destroy(creds);
+    if (!creds || !creds->access_key_id || !creds->secret_access_key) {
+        flb_error("[aws_msk_iam] build_msk_iam_payload: invalid or incomplete "
+                  "credentials");
         return NULL;
     }
 
@@ -430,11 +436,7 @@ static flb_sds_t build_msk_iam_payload(struct flb_aws_msk_iam *config,
                  "(now %ld, margin %ds) - failing token refresh so a fresh "
                  "fetch is attempted instead of presenting a rejected token",
                  (long) creds->expiration, (long) now, FLB_MSK_IAM_CRED_MARGIN);
-        goto error;
-    }
-
-    if (out_expiration) {
-        *out_expiration = creds->expiration;
+        return NULL;
     }
 
     gmtime_r(&now, &gm);
@@ -736,9 +738,6 @@ static flb_sds_t build_msk_iam_payload(struct flb_aws_msk_iam *config,
     if (session_token_enc) {
         flb_sds_destroy(session_token_enc);
     }
-    if (creds) {
-        flb_aws_credentials_destroy(creds);
-    }
 
     return payload;
 
@@ -780,9 +779,6 @@ error:
     if (session_token_enc) {
         flb_sds_destroy(session_token_enc);
     }
-    if (creds) {
-        flb_aws_credentials_destroy(creds);
-    }
 
     return NULL;
 }
@@ -822,7 +818,6 @@ static void oauthbearer_token_refresh_cb(rd_kafka_t *rk,
     int64_t now;
     int64_t md_lifetime_ms;
     time_t adv_expiry;
-    time_t sign_expiration = 0;
     const char *s3_suffix = "-s3";
     size_t arn_len;
     size_t suffix_len;
@@ -880,8 +875,16 @@ static void oauthbearer_token_refresh_cb(rd_kafka_t *rk,
      * short bounded sleep here is fine.
      */
     for (attempt = 0; ; attempt++) {
-        payload = build_msk_iam_payload(config, host, &sign_expiration);
-        if (payload || attempt >= FLB_MSK_IAM_FETCH_ATTEMPTS - 1) {
+        creds = msk_iam_get_credentials(config);
+        if (creds) {
+            payload = build_msk_iam_payload(config, host, creds);
+            if (payload) {
+                break;
+            }
+            flb_aws_credentials_destroy(creds);
+            creds = NULL;
+        }
+        if (attempt >= FLB_MSK_IAM_FETCH_ATTEMPTS - 1) {
             break;
         }
         delay_ms = msk_iam_retry_delay_ms(attempt);
@@ -895,9 +898,6 @@ static void oauthbearer_token_refresh_cb(rd_kafka_t *rk,
         rd_kafka_oauthbearer_set_token_failure(rk, "payload generation failed");
         return;
     }
-
-    /* Credentials for the principal (served from the provider's cache) */
-    creds = msk_iam_get_credentials(config);
 
     now = time(NULL);
     /*
@@ -917,19 +917,19 @@ static void oauthbearer_token_refresh_cb(rd_kafka_t *rk,
      * credentials, so once they expire the held token is rejected even though
      * librdkafka still considers it valid. Cap the advertised expiry to the
      * signing credentials' remaining life (minus margin) so the 0.8x refresh
-     * fires before they die. sign_expiration == 0 means unknown -> no cap.
+     * fires before they die. expiration == 0 means unknown -> no cap.
      */
     adv_expiry = now + 540;
-    if (sign_expiration != 0 &&
-        sign_expiration - FLB_MSK_IAM_CRED_MARGIN < adv_expiry) {
-        adv_expiry = sign_expiration - FLB_MSK_IAM_CRED_MARGIN;
+    if (creds->expiration != 0 &&
+        creds->expiration - FLB_MSK_IAM_CRED_MARGIN < adv_expiry) {
+        adv_expiry = creds->expiration - FLB_MSK_IAM_CRED_MARGIN;
     }
     md_lifetime_ms = (int64_t) adv_expiry * 1000;
 
     err = rd_kafka_oauthbearer_set_token(rk,
                                         payload,
                                         md_lifetime_ms,
-                                        creds ? creds->access_key_id : "unknown",
+                                        creds->access_key_id,
                                         NULL,
                                         0,
                                         errstr,
@@ -1009,6 +1009,14 @@ struct flb_aws_msk_iam *flb_aws_msk_iam_register_oauth_cb(struct flb_config *con
     }
 
     flb_info("[aws_msk_iam] extracted region: %s", ctx->region);
+
+    if (pthread_mutex_init(&ctx->provider_lock, NULL) != 0) {
+        flb_error("[aws_msk_iam] failed to initialize the provider mutex");
+        flb_sds_destroy(ctx->region);
+        flb_sds_destroy(ctx->cluster_arn);
+        flb_free(ctx);
+        return NULL;
+    }
 
     /* Set the callback and opaque */
     rd_kafka_conf_set_oauthbearer_token_refresh_cb(kconf, oauthbearer_token_refresh_cb);
@@ -1100,6 +1108,7 @@ void flb_aws_msk_iam_destroy(struct flb_aws_msk_iam *ctx)
     flb_info("[aws_msk_iam] destroying MSK IAM config");
 
     msk_iam_provider_destroy(ctx->provider, ctx->provider_tls);
+    pthread_mutex_destroy(&ctx->provider_lock);
     if (ctx->region) {
         flb_sds_destroy(ctx->region);
     }
