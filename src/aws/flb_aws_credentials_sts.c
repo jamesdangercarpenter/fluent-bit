@@ -162,6 +162,8 @@ struct flb_aws_credentials *get_credentials_fn_sts(struct flb_aws_provider
         creds->session_token = NULL;
     }
 
+    creds->expiration = implementation->creds->expiration;
+
     return creds;
 
 error:
@@ -467,6 +469,8 @@ struct flb_aws_credentials *get_credentials_fn_eks(struct flb_aws_provider
         creds->session_token = NULL;
     }
 
+    creds->expiration = implementation->creds->expiration;
+
     return creds;
 
 error:
@@ -749,7 +753,7 @@ static int sts_assume_role_request(struct flb_aws_client *sts_client,
                                    char *uri,
                                    time_t *next_refresh)
 {
-    time_t expiration;
+    time_t expiration = 0;
     struct flb_aws_credentials *credentials = NULL;
     struct flb_http_client *c = NULL;
     flb_sds_t error_type;
@@ -776,6 +780,16 @@ static int sts_assume_role_request(struct flb_aws_client *sts_client,
         /* unset and free existing credentials first */
         flb_aws_credentials_destroy(*creds);
         *creds = NULL;
+
+        /*
+         * Record the absolute expiry on the credentials so consumers can tell
+         * how much life they have left. flb_aws_cred_expiration() returns -1
+         * for a timestamp it could not parse, which means "unknown" and is
+         * represented as 0.
+         */
+        if (expiration > 0) {
+            credentials->expiration = expiration;
+        }
 
         *next_refresh = expiration - FLB_AWS_REFRESH_WINDOW;
         *creds = credentials;

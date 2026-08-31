@@ -148,6 +148,8 @@ struct flb_aws_credentials *get_credentials_fn_profile(struct flb_aws_provider
         creds->session_token = NULL;
     }
 
+    creds->expiration = implementation->creds->expiration;
+
     return creds;
 
 error:
@@ -740,6 +742,13 @@ static int refresh_credentials(struct flb_aws_provider_profile *implementation,
     implementation->creds = creds;
 
     if (expiration > 0) {
+        /*
+         * Record the absolute expiry on the credentials too, so consumers can
+         * tell how much life they have left. Only credentials from a
+         * credential_process carry one; those read from the shared
+         * credentials file do not expire and keep the "unknown" value of 0.
+         */
+        creds->expiration = expiration;
         implementation->next_refresh = expiration - FLB_AWS_REFRESH_WINDOW;
     } else {
         implementation->next_refresh = 0;

@@ -122,6 +122,8 @@ struct flb_aws_credentials *get_credentials_fn_ec2(struct flb_aws_provider
         creds->session_token = NULL;
     }
 
+    creds->expiration = implementation->creds->expiration;
+
     return creds;
 }
 
@@ -352,7 +354,8 @@ static int ec2_credentials_request(struct flb_aws_provider_ec2
     flb_sds_t credentials_response;
     size_t credentials_response_len;
     struct flb_aws_credentials *creds;
-    time_t expiration;
+    /* 0 means "no expiry known"; the response may carry no Expiration field */
+    time_t expiration = 0;
 
     ret = flb_aws_imds_request(implementation->imds_interface, cred_path,
                            &credentials_response, &credentials_response_len);
@@ -375,6 +378,15 @@ static int ec2_credentials_request(struct flb_aws_provider_ec2
     implementation->creds = NULL;
     /* set new creds */
     implementation->creds = creds;
+    /*
+     * Record the absolute expiry on the credentials so consumers can tell how
+     * much life they have left. A missing Expiration field leaves this at 0
+     * and flb_aws_cred_expiration() returns -1 for one it cannot parse; both
+     * mean "unknown", which is represented as 0.
+     */
+    if (expiration > 0) {
+        creds->expiration = expiration;
+    }
     implementation->next_refresh = expiration - FLB_AWS_REFRESH_WINDOW;
 
     flb_sds_destroy(credentials_response);
