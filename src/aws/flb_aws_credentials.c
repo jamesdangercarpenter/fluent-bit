@@ -284,11 +284,26 @@ static struct flb_aws_provider_vtable standard_chain_provider_vtable = {
 int flb_standard_chain_provider_refresh_current(struct flb_aws_provider *provider)
 {
     struct flb_aws_provider_chain *implementation;
-    struct flb_aws_provider *sub_provider;
+    struct flb_aws_provider *sub_provider = NULL;
 
     if (provider->provider_vtable == &standard_chain_provider_vtable) {
         implementation = provider->implementation;
+
+        /*
+         * init and refresh write sub_provider under the chain's lock, so read
+         * it under the same lock. The lock is released before refreshing:
+         * the sub-provider takes its own lock, and the chain's refresh path
+         * would deadlock on a second acquisition. Holding only the pointer is
+         * safe because sub-providers live exactly as long as the chain.
+         */
+        if (!try_lock_provider(provider)) {
+            flb_debug("[aws_credentials] a credential refresh is already in "
+                      "progress, skipping the proactive one");
+            return 0;
+        }
         sub_provider = implementation->sub_provider;
+        unlock_provider(provider);
+
         if (sub_provider) {
             return sub_provider->provider_vtable->refresh(sub_provider);
         }
