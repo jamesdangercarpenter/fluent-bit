@@ -74,6 +74,17 @@
 #define FLB_MSK_IAM_RETRY_MAX_MS   5000
 
 /*
+ * Wall-clock budget for the whole retry loop. The attempt count alone does not
+ * bound how long the callback runs, because a single attempt can sit in a
+ * credential fetch for as long as that endpoint's io timeout allows. This
+ * thread is the one rd_kafka_destroy() waits for, so an unbounded callback
+ * delays shutdown past the plugin's flush grace period and the engine gets
+ * killed mid-flush instead. Once the budget is gone we stop starting new
+ * attempts and let librdkafka schedule the next refresh instead.
+ */
+#define FLB_MSK_IAM_RETRY_BUDGET_SEC 30
+
+/*
  * Config plus a persistent credential provider. The provider is created
  * lazily on first use inside the token-refresh callback and reused across
  * refreshes. Persistence is what buys us the standard chain's cache
@@ -857,6 +868,7 @@ static void oauthbearer_token_refresh_cb(rd_kafka_t *rk,
     size_t suffix_len;
     int attempt;
     uint32_t delay_ms;
+    time_t retry_deadline;
     struct flb_aws_msk_iam *config;
     struct flb_aws_credentials *creds = NULL;
     struct flb_kafka_opaque *kafka_opaque;
@@ -908,6 +920,8 @@ static void oauthbearer_token_refresh_cb(rd_kafka_t *rk,
      * slower retry cadence. This thread exists exactly for this work, so a
      * short bounded sleep here is fine.
      */
+    retry_deadline = time(NULL) + FLB_MSK_IAM_RETRY_BUDGET_SEC;
+
     for (attempt = 0; ; attempt++) {
         creds = msk_iam_get_credentials(config);
         if (creds) {
@@ -919,6 +933,12 @@ static void oauthbearer_token_refresh_cb(rd_kafka_t *rk,
             creds = NULL;
         }
         if (attempt >= FLB_MSK_IAM_FETCH_ATTEMPTS - 1) {
+            break;
+        }
+        if (time(NULL) >= retry_deadline) {
+            flb_warn("[aws_msk_iam] giving up after %ds without a token; "
+                     "librdkafka will schedule the next refresh",
+                     FLB_MSK_IAM_RETRY_BUDGET_SEC);
             break;
         }
         delay_ms = msk_iam_retry_delay_ms(attempt);
